@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from time import perf_counter
 from typing import List
@@ -10,6 +11,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.utils import utils
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -25,6 +27,20 @@ _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
     re.IGNORECASE,
 )
+
+DEFAULT_SUBJECT_SYSTEM_PROMPT = """
+# Role: Video Subject Generator
+
+## Goals:
+Generate a single interesting, creative, and catchy video subject or topic for a short video.
+
+## Constraints:
+1. Return ONLY the raw subject text. Do not include any quotes, markdown, formatting, or introductory phrases.
+2. The subject must be concise, typically 2 to 8 words.
+3. If a specific keyword or prompt is provided, generate a subject that is highly relevant to it.
+4. Respond in the same language as the provided keyword or prompt (default to English if none is provided).
+""".strip()
+
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
 # Role: Video Script Generator
@@ -397,6 +413,143 @@ def _generate_response(prompt: str) -> str:
 
     except Exception as e:
         return f"Error: {_sanitize_error_message(e)}"
+
+
+def get_recent_subjects(limit: int = 50) -> list[str]:
+    subjects = []
+    # 1. From filesystem (history tasks)
+    tasks_root = utils.task_dir()
+    if os.path.isdir(tasks_root):
+        task_entries = []
+        try:
+            with os.scandir(tasks_root) as entries:
+                for entry in entries:
+                    if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        task_entries.append((
+                            entry.stat(follow_symlinks=False).st_mtime,
+                            entry.path
+                        ))
+                    except OSError:
+                        continue
+            # Sort by modification time (most recent first)
+            task_entries.sort(key=lambda x: x[0], reverse=True)
+            for _, task_path in task_entries[:limit]:
+                script_file = os.path.join(task_path, "script.json")
+                if os.path.isfile(script_file):
+                    try:
+                        with open(script_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            subj = data.get("params", {}).get("video_subject")
+                            if subj and subj.strip():
+                                subjects.append(subj.strip())
+                    except Exception:
+                        continue
+        except OSError:
+            pass
+
+    # 2. From state manager
+    try:
+        from app.services import state as sm
+        tasks, _ = sm.state.get_all_tasks(1, limit)
+        for t in tasks:
+            subj = t.get("video_subject") or t.get("params", {}).get("video_subject")
+            if subj and subj.strip():
+                subjects.append(subj.strip())
+    except Exception:
+        pass
+
+    # Deduplicate and maintain order
+    seen = set()
+    unique_subjects = []
+    for s in subjects:
+        s_lower = s.lower()
+        if s_lower not in seen:
+            seen.add(s_lower)
+            unique_subjects.append(s)
+            
+    return unique_subjects[:limit]
+
+
+def generate_subject(
+    subject_prompt: str = "",
+    custom_system_prompt: str = "",
+    based_on_recent: bool = False
+) -> str:
+    system_prompt = custom_system_prompt or DEFAULT_SUBJECT_SYSTEM_PROMPT
+    
+    # Retrieve recent subjects
+    recent_subjects = get_recent_subjects(limit=30)
+    
+    prompt = f"{system_prompt}\n\n"
+    
+    if recent_subjects:
+        prompt += "## Previously Used Subjects (DO NOT DUPLICATE ANY OF THESE):\n"
+        for i, s in enumerate(recent_subjects, 1):
+            prompt += f"{i}. {s}\n"
+        prompt += "\n"
+        
+        if based_on_recent:
+            prompt += (
+                "IMPORTANT: The user has selected 'Based on recent'. You must generate a new subject "
+                "that is similar in style, tone, and vibe to the previously used subjects listed above, "
+                "but it must be a completely new and unique topic. Do not repeat or duplicate any of them.\n\n"
+            )
+        else:
+            prompt += (
+                "IMPORTANT: Ensure the generated subject is completely different and unrelated in topic to the "
+                "previously used subjects above. It must be unique.\n\n"
+            )
+            
+    if subject_prompt:
+        prompt += f"Generate a subject based on this guideline or keyword: {subject_prompt}"
+    else:
+        prompt += "Generate a random interesting and catchy video subject."
+    
+    logger.info(f"generating video subject. based_on_recent={based_on_recent}, prompt: {subject_prompt}")
+    
+    for i in range(_max_retries):
+        try:
+            response = _generate_response(prompt=prompt)
+            if response and not response.startswith("Error: "):
+                # clean response from quotes and markdown
+                response = response.strip().replace('"', '').replace("'", "")
+                response = re.sub(r"^subject:\s*", "", response, flags=re.IGNORECASE)
+                response = response.strip()
+                # Check that response is not a duplicate of any recent subject (case insensitive)
+                if response and not any(response.lower() == r.lower() for r in recent_subjects):
+                    logger.success(f"completed subject generation: {response}")
+                    return response
+                else:
+                    logger.warning(f"LLM generated a duplicate or empty subject: {response}. Retrying...")
+            else:
+                logger.error(f"gpt returned an empty response or error for subject generation: {response}")
+        except Exception as e:
+            logger.error(f"failed to generate subject: {e}")
+        
+        if i < _max_retries:
+            logger.warning(f"failed to generate unique video subject, trying again... {i + 1}")
+            
+    # Fallback to some default subject if it fails or keeps duplicating
+    fallback_subjects = [
+        "How artificial intelligence is changing our daily lives",
+        "Top 5 life hacks everyone should know",
+        "The mystery of the deep ocean explained",
+        "Why sleep is more important than you think",
+        "Interesting historical facts that sound fake",
+        "Unbelievable coincidences in history",
+        "How to build lasting habits easily",
+        "The science behind why we dream"
+    ]
+    import random
+    available_fallbacks = [fs for fs in fallback_subjects if not any(fs.lower() == r.lower() for r in recent_subjects)]
+    if not available_fallbacks:
+        available_fallbacks = fallback_subjects
+        
+    selected_fallback = random.choice(available_fallbacks)
+    logger.warning(f"falling back to default unique subject: {selected_fallback}")
+    return selected_fallback
 
 
 def test_connection() -> tuple[bool, str, float]:

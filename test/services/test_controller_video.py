@@ -133,6 +133,48 @@ class TestVideoControllerTasks(unittest.TestCase):
             stop_at="audio",
         )
 
+    def test_create_auto_video_endpoint(self):
+        """
+        验证 create_auto_video 接口能自动生成 subject，
+        转换成 TaskVideoRequest 并正确加入队列，且返回带 generated_subject 的响应。
+        """
+        from app.models.schema import AutoVideoRequest
+        
+        body = AutoVideoRequest(
+            subject_prompt="artificial intelligence",
+            paragraph_number=1,
+            video_script_prompt="creative and inspiring"
+        )
+        
+        with (
+            patch.object(video_controller.llm_service, "generate_subject", return_value="The Future of AI") as generate_subject,
+            patch.object(video_controller.utils, "get_uuid", return_value="task-abc"),
+            patch.object(video_controller.sm.state, "update_task") as update_task,
+            patch.object(video_controller.task_manager, "add_task") as add_task,
+        ):
+            response = video_controller.create_auto_video(
+                None, self._request(), body
+            )
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["data"]["task_id"], "task-abc")
+        self.assertEqual(response["data"]["generated_subject"], "The Future of AI")
+        
+        generate_subject.assert_called_once_with(
+            subject_prompt="artificial intelligence",
+            custom_system_prompt="",
+            based_on_recent=False
+        )
+        update_task.assert_called_once_with("task-abc")
+        
+        add_task.assert_called_once()
+        called_args = add_task.call_args[1]
+        self.assertEqual(called_args["task_id"], "task-abc")
+        self.assertEqual(called_args["stop_at"], "video")
+        
+        called_params = called_args["params"]
+        self.assertEqual(called_params.video_subject, "The Future of AI")
+
     def test_create_task_removes_state_when_queue_is_full(self):
         """队列已满时必须回滚刚创建的状态，并向调用方返回 429。"""
         body = MagicMock()

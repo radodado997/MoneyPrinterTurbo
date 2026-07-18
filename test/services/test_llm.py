@@ -116,6 +116,49 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("- number of paragraphs: 2", captured["prompt"])
         self.assertIn("开头更有悬念", captured["prompt"])
 
+    def test_generate_subject_sends_prompt_to_llm(self):
+        captured = {}
+
+        def fake_generate_response(prompt):
+            captured["prompt"] = prompt
+            return "How AI is changing our lives"
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_subject(
+                subject_prompt="artificial intelligence",
+            )
+
+        self.assertEqual(result, "How AI is changing our lives")
+        self.assertIn("Generate a subject based on this guideline or keyword: artificial intelligence", captured["prompt"])
+
+    def test_generate_subject_with_exclusions_and_based_on_recent(self):
+        """
+        验证 generate_subject 在 based_on_recent=True 时会将最近使用的主题添加到 prompt 中，
+        且生成的 subject 不会与最近的主题重复（不重复校验），并在重复时触发重试和 fallback。
+        """
+        captured = {}
+
+        def fake_generate_response(prompt):
+            captured["prompt"] = prompt
+            return "A Day in Paris"
+
+        with (
+            patch.object(llm, "get_recent_subjects", return_value=["A Day in London", "The Future of AI"]) as get_recent,
+            patch.object(llm, "_generate_response", side_effect=fake_generate_response)
+        ):
+            result = llm.generate_subject(
+                subject_prompt="travel guide",
+                based_on_recent=True
+            )
+
+        self.assertEqual(result, "A Day in Paris")
+        get_recent.assert_called_once()
+        self.assertIn("A Day in London", captured["prompt"])
+        self.assertIn("The Future of AI", captured["prompt"])
+        self.assertIn("Based on recent", captured["prompt"])
+
     def test_generate_terms_can_request_script_ordered_keywords(self):
         """
         按文案顺序匹配素材依赖 LLM 返回有序关键词。这里不调用真实模型，

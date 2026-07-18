@@ -10,7 +10,8 @@ class TestBackgroundTaskService(unittest.TestCase):
         params = VideoParams(video_subject="Coffee")
 
         with patch.object(tm, "threading") as threading_mock:
-            thread = object()
+            from unittest.mock import MagicMock
+            thread = MagicMock()
             threading_mock.Thread.return_value = thread
             task_id = tm.start_background_task("bg-task", params)
 

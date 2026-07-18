@@ -226,10 +226,37 @@ class VideoSocialMetadataRequest(VideoSocialMetadataParams, BaseModel):
     pass
 
 
+class AutoVideoRequest(VideoParams, BaseModel):
+    video_subject: Optional[str] = ""
+    subject_prompt: Optional[str] = ""
+    custom_subject_system_prompt: Optional[str] = ""
+    based_on_recent: bool = False
+
+
 ######################################################################################################
 ######################################################################################################
 ######################################################################################################
 ######################################################################################################
+class AutoVideoResponse(BaseResponse):
+    class AutoVideoResponseData(BaseModel):
+        task_id: str
+        generated_subject: str
+
+    data: AutoVideoResponseData
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558",
+                    "generated_subject": "How AI is changing our lives"
+                },
+            },
+        }
+
+
 class TaskResponse(BaseResponse):
     class TaskResponseData(BaseModel):
         task_id: str
