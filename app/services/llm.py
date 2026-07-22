@@ -12,7 +12,7 @@ from openai.types.chat import ChatCompletion
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 
-_max_retries = 9
+_max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -653,7 +653,7 @@ Suggest the subject of the next video in an ongoing series.
 ## Rules
 1. Return exactly one concise video subject, and nothing else.
 2. {selection_rule}
-3. Do not repeat or closely copy any subject in the exclusion list.
+3. STRICT RULE — NEVER REPEAT ANY SUBJECT: Do not repeat, closely copy, paraphrase, reuse wording from, or generate any subject that appears in (or is semantically similar to) ANY item in the exclusion list below. This is an absolute prohibition — treat every listed subject as permanently forbidden.
 4. Do not add a title prefix, numbering, quotation marks, markdown, or an explanation.
 5. {language_rule}
 {randomization_context}
