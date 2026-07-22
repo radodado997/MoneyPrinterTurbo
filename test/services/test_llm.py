@@ -179,6 +179,42 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, "A new coffee experiment")
         self.assertEqual(generate.call_count, 2)
 
+    def test_generate_next_video_subject_treats_recent_subjects_as_excluded(self):
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=["Coffee grinder basics", "A new coffee experiment"],
+        ) as generate:
+            result = llm.generate_next_video_subject(
+                video_subject="Coffee",
+                recent_subjects=["Coffee grinder basics"],
+            )
+
+        self.assertEqual(result, "A new coffee experiment")
+        self.assertEqual(generate.call_count, 2)
+
+    def test_generate_next_video_subject_promotes_rejected_duplicate_into_retry_prompt(self):
+        prompts = []
+
+        def fake_generate_response(prompt):
+            prompts.append(prompt)
+            return "Hidden duplicate" if len(prompts) == 1 else "A new coffee experiment"
+
+        with (
+            patch.object(llm, "MAX_ROLL_EXCLUDED_SUBJECTS", 1),
+            patch.object(llm, "_generate_response", side_effect=fake_generate_response),
+        ):
+            result = llm.generate_next_video_subject(
+                video_subject="",
+                excluded_subjects=["Visible duplicate", "Hidden duplicate"],
+            )
+
+        self.assertEqual(result, "A new coffee experiment")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Visible duplicate", prompts[0])
+        self.assertNotIn("Hidden duplicate", prompts[0])
+        self.assertIn("Hidden duplicate", prompts[1])
+
     def test_generate_terms_can_request_script_ordered_keywords(self):
         """
         按文案顺序匹配素材依赖 LLM 返回有序关键词。这里不调用真实模型，

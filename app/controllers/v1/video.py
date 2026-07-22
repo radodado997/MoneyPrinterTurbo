@@ -398,12 +398,17 @@ def create_task(
     _apply_api_ui_defaults(body)
 
     try:
+        params_payload = body.model_dump()
         task = {
             "task_id": task_id,
             "request_id": request_id,
-            "params": body.model_dump(),
+            "params": params_payload,
         }
-        sm.state.update_task(task_id)
+        sm.state.update_task(
+            task_id,
+            params=params_payload,
+            video_subject=params_payload.get("video_subject", ""),
+        )
         task_manager.add_task(tm.start, task_id=task_id, params=body, stop_at=stop_at)
         logger.success(f"Task created: {utils.to_json(task)}")
         return utils.get_response(200, task)
