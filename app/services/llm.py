@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import secrets
 from time import perf_counter
 from typing import List
 
@@ -16,6 +17,9 @@ MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
+MAX_ROLL_SUBJECT_LENGTH = 500
+MAX_ROLL_CONTEXT_SUBJECTS = 20
+MAX_ROLL_EXCLUDED_SUBJECTS = 200
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -564,6 +568,215 @@ def generate_script(
     else:
         logger.success(f"completed: \n{final_script}")
     return final_script.strip()
+
+
+def _subject_comparison_key(subject: str) -> str:
+    """Normalize a subject for exact duplicate detection across generated tasks."""
+    return re.sub(r"[\W_]+", "", str(subject or "").casefold())
+
+
+def build_next_video_subject_prompt(
+    video_subject: str = "",
+    recent_subjects: list[str] | None = None,
+    language: str = "",
+    based_on_recent: bool = True,
+    excluded_subjects: list[str] | None = None,
+    randomization_hint: str = "",
+) -> str:
+    """Build the prompt used by the WebUI's next-subject (roll) action.
+
+    ``based_on_recent`` controls whether the model should stay in the category
+    suggested by the latest videos or choose from any category. ``excluded`` is
+    intentionally separate from the recent context: random mode still receives
+    the complete generated-topic exclusion list, without being influenced by the
+    latest category.
+    """
+    current_subject = (video_subject or "").strip()
+    normalized_recent_subjects = []
+    for subject in recent_subjects or []:
+        subject = str(subject or "").strip()
+        if subject and subject not in normalized_recent_subjects:
+            normalized_recent_subjects.append(subject)
+        if len(normalized_recent_subjects) >= MAX_ROLL_CONTEXT_SUBJECTS:
+            break
+
+    normalized_excluded_subjects = []
+    for subject in excluded_subjects or []:
+        subject = str(subject or "").strip()
+        if subject and subject not in normalized_excluded_subjects:
+            normalized_excluded_subjects.append(subject)
+        if len(normalized_excluded_subjects) >= MAX_ROLL_EXCLUDED_SUBJECTS:
+            break
+
+    if based_on_recent:
+        current_context = current_subject or (
+            normalized_recent_subjects[0] if normalized_recent_subjects else "(none)"
+        )
+    else:
+        current_context = "(ignore current subject; choose independently)"
+    history_context = "\n".join(
+        f"- {subject}" for subject in normalized_recent_subjects
+    ) or "- (none)"
+    excluded_context = "\n".join(
+        f"- {subject}" for subject in normalized_excluded_subjects
+    ) or "- (none)"
+    language_rule = (
+        f"Write the suggestion in {language}."
+        if language
+        else "Use the same language as the current subject when one is available."
+    )
+
+    if based_on_recent:
+        selection_rule = (
+            "Infer the shared category or content niche from the latest video "
+            "subjects, then suggest a fresh subject in that same category."
+        )
+        history_title = "Latest Video Subjects (use these to infer the category)"
+    else:
+        selection_rule = (
+            "Choose a completely random subject from any category. Do not use the "
+            "latest subjects as a category constraint."
+        )
+        history_title = "Latest Video Subjects (do not use these as a category constraint)"
+
+    randomization_context = (
+        f"\nRandomization token (do not mention it): {randomization_hint}"
+        if randomization_hint
+        else ""
+    )
+
+    return f"""
+# Role: Short-Form Video Content Strategist
+
+Suggest the subject of the next video in an ongoing series.
+
+## Rules
+1. Return exactly one concise video subject, and nothing else.
+2. {selection_rule}
+3. Do not repeat or closely copy any subject in the exclusion list.
+4. Do not add a title prefix, numbering, quotation marks, markdown, or an explanation.
+5. {language_rule}
+{randomization_context}
+
+## Current Video Subject
+{current_context}
+
+## {history_title}
+{history_context}
+
+## Previously Generated Subjects — NEVER REPEAT
+{excluded_context}
+
+Return only the new subject.
+""".strip()
+
+
+def _normalize_next_video_subject(response: str) -> str:
+    """Turn a free-form model response into one safe subject line."""
+    subject = (response or "").strip()
+    if not subject or subject.startswith("Error: "):
+        return ""
+
+    subject = _strip_code_fence(subject)
+    # Ollama and other local models sometimes return a tiny JSON object despite
+    # the raw-text instruction. Accept the common field names so the UI does not
+    # put the JSON wrapper into the Video Subject input. Strip a possible list
+    # marker first because some models answer with ``1. {"subject": ...}``.
+    json_candidate = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", subject)
+    if json_candidate.startswith("{"):
+        try:
+            payload = json.loads(json_candidate)
+            if isinstance(payload, dict):
+                subject = (
+                    payload.get("subject")
+                    or payload.get("video_subject")
+                    or payload.get("title")
+                    or ""
+                )
+        except (TypeError, ValueError):
+            pass
+
+    # Models occasionally ignore the one-line instruction and add a short
+    # preamble. Keep the first non-empty line, then remove common list/title
+    # decoration without changing the user's language.
+    subject = next((line.strip() for line in str(subject).splitlines() if line.strip()), "")
+    subject = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", subject)
+    subject = re.sub(
+        r"^(?:subject|video subject|next video subject)\s*:\s*",
+        "",
+        subject,
+        flags=re.IGNORECASE,
+    )
+    subject = subject.strip().strip('\\\"“”‘’')
+    if len(subject) > MAX_ROLL_SUBJECT_LENGTH:
+        subject = subject[:MAX_ROLL_SUBJECT_LENGTH].rstrip()
+    return subject
+
+
+def generate_next_video_subject(
+    video_subject: str = "",
+    recent_subjects: list[str] | None = None,
+    language: str = "",
+    based_on_recent: bool = True,
+    excluded_subjects: list[str] | None = None,
+) -> str:
+    """Generate one follow-up subject for the WebUI roll button.
+
+    Unlike ``generate_script`` this endpoint must return a single line. Provider
+    errors are returned with the existing ``Error:`` prefix so the UI can show a
+    useful message instead of treating an error string as a valid subject. Exact
+    duplicates are rejected locally as an additional guard beyond the prompt.
+    """
+    normalized_excluded_subjects = []
+    excluded_keys = set()
+    for candidate in excluded_subjects or []:
+        candidate = str(candidate or "").strip()
+        key = _subject_comparison_key(candidate)
+        if candidate and key and key not in excluded_keys:
+            normalized_excluded_subjects.append(candidate)
+            excluded_keys.add(key)
+
+    current_key = _subject_comparison_key(video_subject)
+    if current_key and current_key not in excluded_keys:
+        normalized_excluded_subjects.append((video_subject or "").strip())
+        excluded_keys.add(current_key)
+
+    last_error = "Error: unable to generate the next video subject"
+    for attempt in range(_max_retries):
+        prompt = build_next_video_subject_prompt(
+            video_subject=video_subject,
+            recent_subjects=recent_subjects,
+            language=language,
+            based_on_recent=based_on_recent,
+            excluded_subjects=normalized_excluded_subjects,
+            # A fresh hint makes unticked random mode meaningfully different
+            # even when the configured provider uses deterministic sampling.
+            randomization_hint=secrets.token_hex(8),
+        )
+        response = _generate_response(prompt)
+        if isinstance(response, str) and response.startswith("Error: "):
+            last_error = response
+        else:
+            subject = _normalize_next_video_subject(response)
+            subject_key = _subject_comparison_key(subject)
+            if subject and subject_key and subject_key not in excluded_keys:
+                logger.success(f"next video subject generated: {subject}")
+                return subject
+            if subject:
+                last_error = "Error: the LLM repeated an already generated subject"
+                logger.warning(
+                    "next video subject repeated an existing topic; requesting a different one"
+                )
+            else:
+                last_error = "Error: the LLM returned an empty video subject"
+
+        if attempt < _max_retries - 1:
+            logger.warning(
+                f"failed to generate next video subject, trying again... {attempt + 1}"
+            )
+
+    logger.error(f"failed to generate next video subject: {last_error}")
+    return last_error
 
 
 def _strip_code_fence(text: str) -> str:

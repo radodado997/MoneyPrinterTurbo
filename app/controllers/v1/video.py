@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import pathlib
 import shutil
@@ -18,6 +19,8 @@ from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
 from app.models.schema import (
     AudioRequest,
+    GenerateVideoRequest,
+    GenerateVideoResponse,
     BgmRetrieveResponse,
     BgmUploadResponse,
     SubtitleRequest,
@@ -30,8 +33,10 @@ from app.models.schema import (
     VideoMaterialRetrieveResponse
 )
 from app.services import bgm as bgm_service
+from app.services import llm
 from app.services import state as sm
 from app.services import task as tm
+from app.services import voice
 from app.utils import file_security, utils
 
 # 认证依赖项
@@ -59,6 +64,114 @@ else:
         max_concurrent_tasks=_max_concurrent_tasks,
         max_queued_tasks=_max_queued_tasks,
     )
+
+
+def _json_safe_payload(payload):
+    """Convert optional bytes/custom values before Starlette renders JSON."""
+    serialized = utils.to_json(payload)
+    if serialized is None:
+        raise ValueError("failed to serialize API response")
+    return json.loads(serialized)
+
+
+def _default_api_voice(video_language: str | None) -> str:
+    """Resolve the WebUI [ui] voice before falling back to a language voice."""
+    ui_voice_mode = str(config.ui.get("voice_mode", "tts") or "tts").strip().lower()
+    if ui_voice_mode == "none":
+        return voice.NO_VOICE_NAME
+
+    configured_voice = str(config.ui.get("voice_name", "") or "").strip()
+    configured_tts_server = str(
+        config.ui.get("tts_server", "azure-tts-v1") or "azure-tts-v1"
+    ).strip().lower()
+    if configured_voice:
+        # Chatterbox settings are sometimes stored as just the voice id in older
+        # configs. The dispatcher requires the provider prefix.
+        if configured_tts_server == "chatterbox" and ":" not in configured_voice:
+            return f"chatterbox:{configured_voice}"
+        return configured_voice
+
+    if configured_tts_server == "chatterbox":
+        configured_chatterbox_voices = voice.get_chatterbox_voices()
+        if configured_chatterbox_voices:
+            return configured_chatterbox_voices[0]
+
+    language = str(video_language or "").strip().replace("_", "-").lower()
+    try:
+        all_voices = [
+            voice_name
+            for voice_name in voice.get_all_azure_voices(filter_locals=None)
+            if "V2" not in voice_name
+        ]
+    except (OSError, ValueError):
+        all_voices = []
+
+    if language:
+        exact_matches = [
+            voice_name
+            for voice_name in all_voices
+            if voice_name.lower().startswith(f"{language}-")
+        ]
+        if exact_matches:
+            return exact_matches[0]
+
+        language_prefix = language.split("-", 1)[0]
+        language_matches = [
+            voice_name
+            for voice_name in all_voices
+            if voice_name.lower().startswith(f"{language_prefix}-")
+        ]
+        if language_matches:
+            return language_matches[0]
+
+    # Preserve the project's established default for auto-detected/unknown
+    # languages. Clients can always override this with voice_name or no-voice.
+    return "zh-CN-XiaoxiaoNeural-Female"
+
+
+def _provided_fields(body) -> set[str]:
+    fields = getattr(body, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(body, "__fields_set__", set())
+    return set(fields or set())
+
+
+def _apply_api_ui_defaults(body) -> None:
+    """Apply values from config.toml [ui] to omitted API generation fields."""
+    ui = config.ui
+    provided_fields = _provided_fields(body)
+
+    ui_defaults = {
+        "font_name": ui.get("font_name"),
+        "subtitle_position": ui.get("subtitle_position"),
+        "custom_position": ui.get("custom_position"),
+        "text_fore_color": ui.get("text_fore_color"),
+        "font_size": ui.get("font_size"),
+        "voice_volume": ui.get("voice_volume"),
+        "voice_rate": ui.get("voice_rate"),
+        "subtitle_enabled": ui.get("subtitle_enabled"),
+    }
+    for field_name, value in ui_defaults.items():
+        if field_name not in provided_fields and value is not None:
+            setattr(body, field_name, value)
+
+    if "text_background_color" not in provided_fields and (
+        "subtitle_background_enabled" in ui or "subtitle_background_color" in ui
+    ):
+        body.text_background_color = (
+            ui.get("subtitle_background_color", "#000000")
+            if bool(ui.get("subtitle_background_enabled", False))
+            else False
+        )
+    if "rounded_subtitle_background" not in provided_fields:
+        value = ui.get("rounded_subtitle_background")
+        if value is not None:
+            body.rounded_subtitle_background = bool(value)
+
+    if not str(getattr(body, "voice_name", "") or "").strip():
+        body.voice_name = _default_api_voice(
+            getattr(body, "video_language", "")
+        )
 
 
 def _sanitize_upload_filename(filename: str, request_id: str) -> str:
@@ -162,6 +275,91 @@ def _parse_byte_range(
     return start, end
 
 
+@router.post(
+    "/generate",
+    response_model=GenerateVideoResponse,
+    summary="Roll an optional subject, generate script and keywords, and queue a video",
+)
+def generate_video_workflow(
+    background_tasks: BackgroundTasks, request: Request, body: GenerateVideoRequest
+):
+    """Run the same three-step workflow as the WebUI in one API request."""
+    request_id = base.get_task_id(request)
+    subject = (body.video_subject or "").strip()
+
+    if body.roll_next_subject:
+        recent_subjects, all_subjects = tm.collect_subject_history()
+        based_on_recent = (
+            body.based_on_previous
+            if body.based_on_previous is not None
+            else body.based_on_recent
+        )
+        subject = llm.generate_next_video_subject(
+            video_subject=subject,
+            recent_subjects=recent_subjects,
+            language=body.video_language or "",
+            based_on_recent=based_on_recent,
+            excluded_subjects=all_subjects,
+        )
+        if not subject or subject.startswith("Error: "):
+            raise HttpException(
+                task_id=request_id,
+                status_code=502,
+                message=f"{request_id}: {subject or 'failed to generate next subject'}",
+            )
+
+    if not subject:
+        raise HttpException(
+            task_id=request_id,
+            status_code=400,
+            message=f"{request_id}: video_subject is required when roll_next_subject is false",
+        )
+
+    # Generate the script and terms before queuing the video. Supplying both on
+    # the task model prevents the background worker from repeating these LLM
+    # calls and lets the API return the generated content immediately.
+    video_script = llm.generate_script(
+        video_subject=subject,
+        language=body.video_language or "",
+        paragraph_number=body.paragraph_number,
+        video_script_prompt=body.video_script_prompt,
+        custom_system_prompt=body.custom_system_prompt,
+    )
+    if not video_script or video_script.startswith("Error: "):
+        raise HttpException(
+            task_id=request_id,
+            status_code=502,
+            message=f"{request_id}: failed to generate video script",
+        )
+
+    video_terms = llm.generate_terms(
+        video_subject=subject,
+        video_script=video_script,
+        amount=8 if body.match_materials_to_script else 5,
+        match_script_order=body.match_materials_to_script,
+    )
+    if not video_terms:
+        raise HttpException(
+            task_id=request_id,
+            status_code=502,
+            message=f"{request_id}: failed to generate video keywords",
+        )
+
+    body.video_subject = subject
+    body.video_script = video_script
+    body.video_terms = video_terms
+    task_response = create_task(request, body, stop_at="video")
+    task_data = task_response.get("data", {})
+
+    response = {
+        "task_id": task_data.get("task_id", ""),
+        "video_subject": subject,
+        "video_script": video_script,
+        "video_terms": video_terms,
+    }
+    return utils.get_response(200, _json_safe_payload(response))
+
+
 @router.post("/videos", response_model=TaskResponse, summary="Generate a short video")
 def create_video(
     background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
@@ -185,11 +383,20 @@ def create_audio(
 
 def create_task(
     request: Request,
-    body: Union[TaskVideoRequest, SubtitleRequest, AudioRequest],
+    body: Union[
+        TaskVideoRequest,
+        GenerateVideoRequest,
+        SubtitleRequest,
+        AudioRequest,
+    ],
     stop_at: str,
 ):
     task_id = utils.get_uuid()
     request_id = base.get_task_id(request)
+    # API callers do not go through the WebUI controls. Reuse [ui] defaults for
+    # omitted values, including the configured TTS provider and voice.
+    _apply_api_ui_defaults(body)
+
     try:
         task = {
             "task_id": task_id,

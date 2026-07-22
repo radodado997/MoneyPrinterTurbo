@@ -44,7 +44,13 @@ from app.services import cache_manager, llm, video, voice
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
-from webui.auth import authenticate, is_auth_enabled
+from webui.auth import (
+    AUTH_QUERY_PARAM,
+    authenticate,
+    create_persistent_session,
+    is_auth_enabled,
+    validate_persistent_session,
+)
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -249,6 +255,10 @@ def _initialize_session_state():
         "generation_log_records": [],
         # 生成按钮回调先登记任务，使顶部入口能立即显示运行中数量。
         "active_generation_tasks": {},
+        # Roll 的 LLM 请求本身也跨 fragment rerun 保留状态，防止重复点击。
+        "roll_subject_generation_in_progress": False,
+        # 默认保持原有“基于最近视频”的连续选题行为；取消勾选后使用随机主题。
+        "roll_based_on_recent": True,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -264,7 +274,14 @@ def tr(key):
 
 if is_auth_enabled():
     if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
+        persistent_token = st.query_params.get(AUTH_QUERY_PARAM, "")
+        st.session_state.authenticated = validate_persistent_session(persistent_token)
+        if persistent_token and not st.session_state.authenticated:
+            # Remove expired/invalid tokens so a stale URL does not keep being
+            # revalidated on every rerun. Valid tokens intentionally remain in
+            # the URL so a browser refresh or a new Streamlit websocket stays
+            # authenticated without another login prompt.
+            st.query_params.pop(AUTH_QUERY_PARAM, None)
 
     if not st.session_state.authenticated:
         st.set_page_config(page_title="MoneyPrinterTurbo", page_icon="🤖", layout="centered")
@@ -276,6 +293,11 @@ if is_auth_enabled():
         if st.button(tr("Login")):
             if authenticate(username, password):
                 st.session_state.authenticated = True
+                st.session_state.authenticated_username = username
+                # Streamlit session_state is websocket-scoped. Persist a random
+                # server-validated bearer token in the URL so the login survives
+                # refreshes and process restarts. The server stores only its hash.
+                st.query_params[AUTH_QUERY_PARAM] = create_persistent_session(username)
                 st.rerun()
             else:
                 st.error(tr("Login Error"))
@@ -442,6 +464,52 @@ def _prepare_generation_task():
     _add_active_generation_task(task_id, subject=subject)
 
 
+def _cleanup_finished_active_generation_tasks():
+    """Remove optimistic UI entries after the worker reaches a terminal state."""
+    for task_id in _active_generation_tasks():
+        try:
+            task = sm.state.get_task(task_id)
+        except Exception as e:
+            logger.debug(f"failed to inspect active task {task_id}: {e}")
+            continue
+
+        if task and _normalize_task_state(task.get("state")) in {
+            const.TASK_STATE_COMPLETE,
+            const.TASK_STATE_FAILED,
+        }:
+            _remove_active_generation_task(task_id)
+            continue
+
+        # If a worker disappeared without writing state (for example because the
+        # thread could not be started), do not leave the Roll button disabled
+        # forever. Keep the short grace period for the initial thread start.
+        active_task = _active_generation_tasks().get(task_id, {})
+        if (
+            not task
+            and not tm.is_background_task_running(task_id)
+            and datetime.now().timestamp() - active_task.get("mtime", 0) > 60
+        ):
+            _remove_active_generation_task(task_id)
+
+
+def _has_generation_in_progress():
+    """Return true for current-session and cross-session running tasks."""
+    _cleanup_finished_active_generation_tasks()
+    if _active_generation_tasks():
+        return True
+
+    try:
+        runtime_tasks, _ = sm.state.get_all_tasks(1, 1000)
+    except Exception as e:
+        logger.debug(f"failed to inspect runtime tasks for Roll: {e}")
+        return False
+
+    return any(
+        _normalize_task_state(task.get("state")) == const.TASK_STATE_PROCESSING
+        for task in runtime_tasks
+    )
+
+
 def _task_state_label(state, has_video):
     normalized_state = _normalize_task_state(state)
     if normalized_state == const.TASK_STATE_COMPLETE:
@@ -524,10 +592,15 @@ def _scan_history_tasks(limit=30):
 
 
 def _collect_task_summaries(limit=20):
-    history_tasks = {task["task_id"]: task for task in _scan_history_tasks(limit=50)}
+    _cleanup_finished_active_generation_tasks()
+    scan_limit = max(50, int(limit or 0))
+    history_tasks = {
+        task["task_id"]: task
+        for task in _scan_history_tasks(limit=scan_limit)
+    }
 
     try:
-        runtime_tasks, _ = sm.state.get_all_tasks(1, 50)
+        runtime_tasks, _ = sm.state.get_all_tasks(1, scan_limit)
     except Exception as e:
         logger.warning(f"failed to load runtime tasks: {e}")
         runtime_tasks = []
@@ -1943,16 +2016,155 @@ def _render_settings_dialog():
 # -----------------------------------------------------------------------------
 
 
+def _roll_subject_key(subject):
+    return re.sub(r"[\W_]+", "", str(subject or "").casefold())
+
+
+def _roll_subject_context(current_subject=""):
+    """Return recent category context plus every known generated subject."""
+    current_subject = (current_subject or "").strip()
+    recent_subjects = []
+    all_subjects = []
+    seen_keys = set()
+
+    try:
+        # The complete list is used for duplicate protection. Task summaries are
+        # sorted newest-first, so the first MAX_ROLL_CONTEXT_SUBJECTS entries are
+        # also the right context for the recent-category mode.
+        tasks = _collect_task_summaries(limit=1000)
+    except Exception as e:
+        logger.debug(f"failed to load subject history for Roll: {e}")
+        tasks = []
+
+    def add_subject(subject, *, add_to_recent=False):
+        subject = str(subject or "").strip()
+        subject_key = _roll_subject_key(subject)
+        if not subject or not subject_key or subject_key in seen_keys:
+            return
+        seen_keys.add(subject_key)
+        all_subjects.append(subject)
+        if add_to_recent and len(recent_subjects) < llm.MAX_ROLL_CONTEXT_SUBJECTS:
+            recent_subjects.append(subject)
+
+    # Include the current input in both contexts. This prevents rolling back to
+    # the same topic even before the current video has been generated.
+    add_subject(current_subject, add_to_recent=True)
+    for task in tasks:
+        task_status = _task_state_filter_key(task)
+        if task_status == "processing":
+            continue
+        # Completed topics shape the recent-category context. Failed/history
+        # tasks still belong to the exclusion set when a script was persisted,
+        # preventing a later roll from reusing an already attempted topic.
+        subject = task.get("subject")
+        if subject and str(subject).strip() == str(task.get("task_id", "")):
+            continue
+        add_subject(subject, add_to_recent=task_status == "complete")
+
+    return recent_subjects, all_subjects
+
+
+@st.fragment(run_every="2s")
+def _render_roll_controls():
+    """Render and refresh the next-subject action without disturbing the form."""
+    video_generation_in_progress = _has_generation_in_progress()
+    roll_in_progress = bool(
+        st.session_state.get("roll_subject_generation_in_progress", False)
+    )
+    roll_disabled = video_generation_in_progress or roll_in_progress
+
+    st.checkbox(
+        tr("Based on Recent"),
+        key="roll_based_on_recent",
+        help=tr("Based on Recent Help"),
+    )
+
+    roll_clicked = st.button(
+        tr("Roll Next Subject"),
+        key="roll_next_subject_button",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/casino:",
+        help=tr("Roll Next Subject Help"),
+        disabled=roll_disabled,
+    )
+
+    if video_generation_in_progress:
+        # This is deliberately below the button. The fragment refreshes every two
+        # seconds, so the control is re-enabled automatically once the worker
+        # reaches a terminal state, even when generation runs in the background.
+        st.info(tr("Video Generation in Progress"))
+    elif roll_in_progress:
+        st.info(tr("Rolling Next Subject"))
+
+    if not roll_clicked:
+        return
+
+    # The click starts an LLM request in this same fragment run. Render the
+    # message before waiting so the user immediately sees why another click is
+    # not possible.
+    st.info(tr("Rolling Next Subject"))
+    st.session_state["roll_subject_generation_in_progress"] = True
+    current_subject = st.session_state.get("video_subject", "").strip()
+    based_on_recent = bool(st.session_state.get("roll_based_on_recent", True))
+    recent_subjects, all_subjects = _roll_subject_context(current_subject)
+    language = st.session_state.get(
+        localized_widget_key("script_language_select"), ""
+    )
+
+    try:
+        with st.spinner(tr("Rolling Next Subject")):
+            with config.runtime_config_lock():
+                suggested_subject = llm.generate_next_video_subject(
+                    video_subject=current_subject,
+                    recent_subjects=recent_subjects,
+                    language=language,
+                    based_on_recent=based_on_recent,
+                    excluded_subjects=all_subjects,
+                )
+    finally:
+        st.session_state["roll_subject_generation_in_progress"] = False
+
+    if not suggested_subject or suggested_subject.startswith("Error: "):
+        error_message = (
+            suggested_subject.removeprefix("Error:").strip()
+            if suggested_subject
+            else tr("Roll Subject Failed")
+        )
+        st.error(f"{tr('Roll Subject Failed')}: {error_message}")
+        return
+
+    # Do not write to the text_input key after that widget has been instantiated
+    # inside this fragment. Apply the result at the beginning of the next full
+    # app rerun instead; this also clears the old script and keywords so the new
+    # subject really starts a fresh video generation.
+    st.session_state["pending_roll_subject"] = suggested_subject
+    st.rerun(scope="app")
+
+
+def _apply_pending_roll_subject():
+    suggested_subject = st.session_state.pop("pending_roll_subject", None)
+    if suggested_subject is None:
+        return
+
+    st.session_state["video_subject"] = str(suggested_subject).strip()
+    st.session_state["video_script"] = ""
+    st.session_state["video_terms"] = ""
+    st.toast(tr("Next Video Subject Suggested"))
+
+
 def _render_script_settings(panel, params):
     """渲染文案设置并更新生成参数。"""
     with panel:
         with st.container(border=True):
             st.write(tr("Video Script Settings"))
+            _apply_pending_roll_subject()
             params.video_subject = st.text_input(
                 tr("Video Subject"),
                 placeholder=tr("Video Subject Placeholder"),
                 key="video_subject",
             ).strip()
+            _render_roll_controls()
 
             video_languages = [
                 (tr("Auto Detect"), ""),
@@ -3313,6 +3525,7 @@ def _render_generation_controls(
                 del records[:-1000]
             render_generation_logs(log_container)
 
+        background_task_started = False
         try:
             st.toast(tr("Generating Video"))
             logger.info(tr("Start Generating Video"))
@@ -3320,10 +3533,16 @@ def _render_generation_controls(
 
             with config.runtime_config_lock():
                 tm.start_background_task(task_id=task_id, params=params)
+            background_task_started = True
+            # Keep the optimistic entry until the worker writes COMPLETE or
+            # FAILED. Otherwise the next rerun can briefly enable Roll while the
+            # background thread is still starting.
+            st.session_state.pop("pending_generation_task_id", None)
             st.success("Video generation started in the background. You can leave the page and come back later.")
             st.info("Progress will continue to update in the task manager while the video is being generated.")
         finally:
-            _remove_active_generation_task(task_id)
+            if not background_task_started:
+                _remove_active_generation_task(task_id)
 
     render_generation_logs(log_container)
 
