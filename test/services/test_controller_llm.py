@@ -48,6 +48,7 @@ class TestLlmController(unittest.TestCase):
             language="en-US",
             based_on_recent=False,
             excluded_subjects=["Coffee history", "Tea history"],
+            subject_reserver=llm_controller.tm.reserve_generated_subject,
         )
 
     def test_generate_video_script_forwards_all_prompt_fields(self):
