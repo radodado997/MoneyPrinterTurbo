@@ -21,6 +21,14 @@ listen_port = 8080
 # 是否隐藏 WebUI 基础配置面板。
 hide_config = false
 
+# --- Ollama Roll Subject Sampling ---
+# Temperature for subject generation (0=deterministic, 1.0=very creative)
+ollama_roll_temperature = 0.9
+# Top-p nucleus sampling (lower = less random)
+ollama_roll_top_p = 0.95
+# Penalty for repeating token sequences (>1.0 discourages repetition)
+ollama_repeat_penalty = 1.1
+
 # Timeout in seconds for a single Edge TTS streaming request.
 # 单次 Edge TTS 流式请求超时时间。慢网络可适当调大，设置为 0 表示禁用超时。
 edge_tts_timeout = 30
