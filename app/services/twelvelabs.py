@@ -23,6 +23,7 @@ The integration is fully opt-in and non-breaking:
 Config (config.toml, [app] section):
     twelvelabs_api_keys = ["tlk_xxx"]   # required to enable
     twelvelabs_rerank_terms = true      # opt-in: reorder search terms by relevance
+    twelvelabs_subject_similarity = true # opt-in: reject similar rolled subjects
     twelvelabs_marengo_model = "marengo3.0"   # optional override
     twelvelabs_pegasus_model = "pegasus1.5"   # optional override
 
@@ -59,7 +60,7 @@ def _client():
     return TwelveLabs(api_key=api_key)
 
 
-def _cosine(a: List[float], b: List[float]) -> float:
+def cosine_similarity(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(x * x for x in b))
@@ -122,7 +123,7 @@ def rerank_terms_by_subject(
         if vec is None:
             # If any term can't be embedded, don't risk a partial reorder.
             return search_terms
-        scored.append((term, _cosine(subject_vec, vec)))
+        scored.append((term, cosine_similarity(subject_vec, vec)))
 
     ranked = [term for term, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
     logger.info(

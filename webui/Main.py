@@ -2061,6 +2061,17 @@ def _roll_subject_context(current_subject=""):
             continue
         add_subject(subject, add_to_recent=task_status == "complete")
 
+    # Roll suggestions are recorded before a task is created. Merge the shared
+    # service history so a restarted WebUI session also gives that ledger to the
+    # LLM as forbidden prompt context, not only to post-response validation.
+    try:
+        _, persisted_subjects = tm.collect_subject_history()
+    except Exception as e:
+        logger.debug(f"failed to load persisted Roll subjects: {e}")
+        persisted_subjects = []
+    for subject in persisted_subjects:
+        add_subject(subject)
+
     return recent_subjects, all_subjects
 
 
@@ -2121,6 +2132,7 @@ def _render_roll_controls():
                     language=language,
                     based_on_recent=based_on_recent,
                     excluded_subjects=all_subjects,
+                    subject_reserver=tm.reserve_generated_subject,
                 )
     finally:
         st.session_state["roll_subject_generation_in_progress"] = False

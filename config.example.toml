@@ -56,6 +56,14 @@ twelvelabs_api_keys = []
 # Reorder search terms using Marengo before downloading materials. This option
 # is ignored when match_materials_to_script is enabled.
 twelvelabs_rerank_terms = false
+# Reject semantically similar rolled video subjects with Marengo embeddings.
+# This is opt-in because every Roll can make embedding API requests. Exact and
+# lexical near-duplicate checks remain available without TwelveLabs.
+twelvelabs_subject_similarity = false
+twelvelabs_subject_similarity_threshold = 0.90
+twelvelabs_subject_similarity_max_subjects = 200
+# Near-identical title wording is rejected locally with no external API call.
+roll_subject_lexical_similarity_threshold = 0.85
 # Optional model overrides. Uncomment only when a different model is required.
 # twelvelabs_marengo_model = "marengo3.0"
 # twelvelabs_pegasus_model = "pegasus1.5"

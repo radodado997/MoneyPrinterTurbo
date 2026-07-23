@@ -39,6 +39,7 @@ def roll_next_subject(request: Request, body: RollSubjectRequest):
         language=body.video_language,
         based_on_recent=based_on_recent,
         excluded_subjects=all_subjects,
+        subject_reserver=tm.reserve_generated_subject,
     )
     if not subject or subject.startswith("Error: "):
         request_id = base.get_task_id(request)

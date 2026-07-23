@@ -300,6 +300,7 @@ def generate_video_workflow(
             language=body.video_language or "",
             based_on_recent=based_on_recent,
             excluded_subjects=all_subjects,
+            subject_reserver=tm.reserve_generated_subject,
         )
         if not subject or subject.startswith("Error: "):
             raise HttpException(

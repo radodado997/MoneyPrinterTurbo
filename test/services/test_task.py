@@ -51,6 +51,18 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(recent_subjects, [])
         self.assertEqual(all_subjects, ["Queued coffee idea"])
 
+    def test_reserved_roll_subjects_are_persisted_and_excluded_from_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(tm.utils, "task_dir", return_value=temp_dir), patch.object(
+                tm.sm.state, "get_all_tasks", return_value=([], 0)
+            ):
+                self.assertTrue(tm.reserve_generated_subject("Coffee science"))
+                self.assertFalse(tm.reserve_generated_subject("coffee-science"))
+                recent_subjects, all_subjects = tm.collect_subject_history()
+
+        self.assertEqual(recent_subjects, [])
+        self.assertEqual(all_subjects, ["Coffee science"])
+
     def test_generate_script_forwards_advanced_prompt_options(self):
         """
         任务生成入口和 WebUI/API 共用 VideoParams。这里验证自动生成文案时，

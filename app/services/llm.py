@@ -3,7 +3,7 @@ import logging
 import re
 import secrets
 from time import perf_counter
-from typing import List
+from typing import Callable, List
 
 from loguru import logger
 from openai import AzureOpenAI, OpenAI
@@ -11,6 +11,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.services import twelvelabs
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -20,6 +21,9 @@ MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
 MAX_ROLL_SUBJECT_LENGTH = 500
 MAX_ROLL_CONTEXT_SUBJECTS = 20
 MAX_ROLL_EXCLUDED_SUBJECTS = 200
+MAX_ROLL_SEMANTIC_SUBJECTS = 200
+DEFAULT_ROLL_SEMANTIC_SIMILARITY_THRESHOLD = 0.90
+DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD = 0.85
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -575,6 +579,88 @@ def _subject_comparison_key(subject: str) -> str:
     return re.sub(r"[\W_]+", "", str(subject or "").casefold())
 
 
+def _subject_token_set(subject: str) -> set[str]:
+    """Return words used for the dependency-free near-duplicate guard."""
+    return set(re.findall(r"\w+", str(subject or "").casefold(), flags=re.UNICODE))
+
+
+def _lexical_subject_similarity(first: str, second: str) -> float:
+    """Jaccard similarity for title wording; semantic embeddings handle meaning."""
+    first_tokens = _subject_token_set(first)
+    second_tokens = _subject_token_set(second)
+    if not first_tokens or not second_tokens:
+        return 0.0
+    return len(first_tokens & second_tokens) / len(first_tokens | second_tokens)
+
+
+def _find_similar_generated_subject(
+    candidate: str, excluded_subjects: list[str]
+) -> tuple[str, float, str] | None:
+    """Return the closest forbidden subject that is too similar to ``candidate``.
+
+    The lexical comparison is free and always available. Embedding comparison is
+    opt-in because it makes an external API request; failure to embed never
+    blocks generation and leaves exact duplicate protection intact.
+    """
+    try:
+        lexical_threshold = float(
+            config.app.get(
+                "roll_subject_lexical_similarity_threshold",
+                DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD,
+            )
+        )
+    except (TypeError, ValueError):
+        lexical_threshold = DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD
+    best_lexical = ("", 0.0)
+    for existing in excluded_subjects:
+        score = _lexical_subject_similarity(candidate, existing)
+        if score > best_lexical[1]:
+            best_lexical = (existing, score)
+    if best_lexical[0] and best_lexical[1] >= lexical_threshold:
+        return best_lexical[0], best_lexical[1], "lexical"
+
+    if not config.app.get("twelvelabs_subject_similarity", False):
+        return None
+
+    candidate_embedding = twelvelabs.embed_text(candidate)
+    if candidate_embedding is None:
+        return None
+
+    try:
+        semantic_threshold = float(
+            config.app.get(
+                "twelvelabs_subject_similarity_threshold",
+                DEFAULT_ROLL_SEMANTIC_SIMILARITY_THRESHOLD,
+            )
+        )
+    except (TypeError, ValueError):
+        semantic_threshold = DEFAULT_ROLL_SEMANTIC_SIMILARITY_THRESHOLD
+    try:
+        semantic_limit = max(
+            1,
+            int(
+                config.app.get(
+                    "twelvelabs_subject_similarity_max_subjects",
+                    MAX_ROLL_SEMANTIC_SUBJECTS,
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        semantic_limit = MAX_ROLL_SEMANTIC_SUBJECTS
+    best_semantic = ("", 0.0)
+    for existing in excluded_subjects[:semantic_limit]:
+        existing_embedding = twelvelabs.embed_text(existing)
+        if existing_embedding is None:
+            # The provider is optional; skip a failed individual comparison.
+            continue
+        score = twelvelabs.cosine_similarity(candidate_embedding, existing_embedding)
+        if score > best_semantic[1]:
+            best_semantic = (existing, score)
+    if best_semantic[0] and best_semantic[1] >= semantic_threshold:
+        return best_semantic[0], best_semantic[1], "semantic"
+    return None
+
+
 def _add_unique_subject_for_comparison(
     subjects: list[str], seen_keys: set[str], subject: str | None
 ) -> bool:
@@ -734,6 +820,7 @@ def generate_next_video_subject(
     language: str = "",
     based_on_recent: bool = True,
     excluded_subjects: list[str] | None = None,
+    subject_reserver: Callable[[str], bool] | None = None,
 ) -> str:
     """Generate one follow-up subject for the WebUI roll button.
 
@@ -802,15 +889,37 @@ def generate_next_video_subject(
         else:
             subject = _normalize_next_video_subject(response)
             subject_key = _subject_comparison_key(subject)
+            similar_subject = None
             if subject and subject_key and subject_key not in excluded_keys:
-                logger.success(f"next video subject generated: {subject}")
-                return subject
-            if subject:
-                last_error = "Error: the LLM repeated an already generated subject"
-                promote_excluded_subject_for_prompt(subject)
-                logger.warning(
-                    "next video subject repeated an existing topic; requesting a different one"
+                similar_subject = _find_similar_generated_subject(
+                    subject, normalized_excluded_subjects
                 )
+                if similar_subject is None:
+                    # Reserving here, immediately after validation, closes the race
+                    # between concurrent Roll requests. A reservation failure means
+                    # another request already accepted this exact subject, so treat
+                    # it exactly like an LLM duplicate and retry with it in context.
+                    if subject_reserver is None or subject_reserver(subject):
+                        logger.success(f"next video subject generated: {subject}")
+                        return subject
+
+            if subject:
+                if similar_subject is not None:
+                    matching_subject, score, method = similar_subject
+                    promote_excluded_subject_for_prompt(matching_subject)
+                    last_error = "Error: the LLM generated a subject too similar to an existing subject"
+                    logger.warning(
+                        f"next video subject was rejected as a {method} match "
+                        f"({score:.3f}) to '{matching_subject}'; requesting a different one"
+                    )
+                else:
+                    last_error = "Error: the LLM repeated an already generated subject"
+                    logger.warning(
+                        "next video subject repeated an existing topic; requesting a different one"
+                    )
+                # Put the rejected wording into the following prompt too. This
+                # prevents retries from merely changing punctuation or a prefix.
+                promote_excluded_subject_for_prompt(subject)
             else:
                 last_error = "Error: the LLM returned an empty video subject"
 

@@ -179,6 +179,82 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, "A new coffee experiment")
         self.assertEqual(generate.call_count, 2)
 
+    def test_generate_next_video_subject_retries_when_subject_cannot_be_reserved(self):
+        prompts = []
+
+        def reserve(subject):
+            return subject != "Concurrent topic"
+
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=lambda prompt: (
+                prompts.append(prompt) or (
+                    "Concurrent topic" if len(prompts) == 1 else "A fresh topic"
+                )
+            ),
+        ):
+            result = llm.generate_next_video_subject(
+                excluded_subjects=[], subject_reserver=reserve
+            )
+
+        self.assertEqual(result, "A fresh topic")
+        self.assertIn("Concurrent topic", prompts[1])
+
+    def test_generate_next_video_subject_rejects_lexical_near_duplicate(self):
+        with patch.dict(
+            llm.config.app,
+            {"roll_subject_lexical_similarity_threshold": 0.70},
+        ), patch.object(
+            llm,
+            "_generate_response",
+            side_effect=["Coffee science guide", "The history of tea"],
+        ) as generate:
+            result = llm.generate_next_video_subject(
+                excluded_subjects=["Coffee science basics"]
+            )
+
+        self.assertEqual(result, "The history of tea")
+        self.assertEqual(generate.call_count, 2)
+
+    def test_generate_next_video_subject_rejects_semantic_near_duplicate(self):
+        embeddings = {
+            "Why coffee roast level changes flavor": [1.0, 0.0],
+            "How roasting changes the taste of coffee": [0.99, 0.01],
+            "The history of tea": [0.0, 1.0],
+        }
+        with (
+            patch.dict(
+                llm.config.app,
+                {
+                    "twelvelabs_subject_similarity": True,
+                    "twelvelabs_subject_similarity_threshold": 0.90,
+                    "roll_subject_lexical_similarity_threshold": 1.0,
+                },
+            ),
+            patch.object(
+                llm.twelvelabs,
+                "embed_text",
+                side_effect=lambda subject: embeddings[subject],
+            ),
+            patch.object(
+                llm.twelvelabs,
+                "cosine_similarity",
+                side_effect=lambda first, second: sum(a * b for a, b in zip(first, second)),
+            ),
+            patch.object(
+                llm,
+                "_generate_response",
+                side_effect=["How roasting changes the taste of coffee", "The history of tea"],
+            ) as generate,
+        ):
+            result = llm.generate_next_video_subject(
+                excluded_subjects=["Why coffee roast level changes flavor"]
+            )
+
+        self.assertEqual(result, "The history of tea")
+        self.assertEqual(generate.call_count, 2)
+
     def test_generate_next_video_subject_treats_recent_subjects_as_excluded(self):
         with patch.object(
             llm,

@@ -20,6 +20,8 @@ _BACKGROUND_TASKS_LOCK = threading.RLock()
 _FINAL_VIDEO_PATTERN = re.compile(
     r"^final-\d+\.(?:mp4|mov|mkv|webm)$", re.IGNORECASE
 )
+_GENERATED_SUBJECTS_FILENAME = ".generated_subjects.json"
+_GENERATED_SUBJECTS_LOCK = threading.RLock()
 
 
 def _subject_key(subject: str) -> str:
@@ -35,6 +37,60 @@ def _task_subject_from_data(data: dict) -> str:
         return str(subject).strip()
     script = data.get("script") or ""
     return str(script).replace("\n", " ").strip()[:40]
+
+
+def _generated_subjects_path() -> str:
+    return os.path.join(utils.task_dir(), _GENERATED_SUBJECTS_FILENAME)
+
+
+def _read_generated_subjects() -> list[str]:
+    """Read the durable ledger of subjects accepted by the Roll source."""
+    try:
+        with open(_generated_subjects_path(), "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    return [str(subject).strip() for subject in payload if str(subject or "").strip()]
+
+
+def reserve_generated_subject(subject: str) -> bool:
+    """Record a Roll suggestion once unless it has already been accepted.
+
+    A Roll response is not necessarily turned into a task, so task history alone
+    cannot prevent a stateless API client (or two concurrent requests) from
+    receiving the same suggestion. This small ledger is deliberately kept beside
+    the existing task history and is consulted on every subsequent Roll.
+    """
+    subject = str(subject or "").strip()
+    key = _subject_key(subject)
+    if not subject or not key:
+        return False
+
+    with _GENERATED_SUBJECTS_LOCK:
+        subjects = _read_generated_subjects()
+        if key in {_subject_key(existing) for existing in subjects}:
+            return False
+
+        subjects.append(subject)
+        ledger_path = _generated_subjects_path()
+        temp_path = f"{ledger_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as file:
+                json.dump(subjects, file, ensure_ascii=False)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, ledger_path)
+        except OSError:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            logger.exception("failed to persist generated-subject ledger")
+            return False
+    return True
 
 
 def collect_subject_history(limit: int = 1000) -> tuple[list[str], list[str]]:
@@ -83,6 +139,11 @@ def collect_subject_history(limit: int = 1000) -> tuple[list[str], list[str]]:
         all_subjects.append(subject)
         if recent:
             recent_subjects.append(subject)
+
+    # Keep accepted Roll suggestions at the front of the exclusion list. Unlike
+    # tasks, a suggestion can exist without a script.json or runtime task.
+    for subject in reversed(_read_generated_subjects()):
+        add_subject(subject)
 
     for _, task_id, task_path in entries[:limit]:
         script_file = os.path.join(task_path, "script.json")
