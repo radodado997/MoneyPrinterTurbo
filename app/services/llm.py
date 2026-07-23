@@ -23,7 +23,7 @@ MAX_ROLL_CONTEXT_SUBJECTS = 20
 MAX_ROLL_EXCLUDED_SUBJECTS = 200
 MAX_ROLL_SEMANTIC_SUBJECTS = 200
 DEFAULT_ROLL_SEMANTIC_SIMILARITY_THRESHOLD = 0.90
-DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD = 0.60
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -145,7 +145,7 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
+def _generate_response(prompt: str, **kwargs) -> str:
     try:
         llm_provider = str(
             config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
@@ -388,7 +388,7 @@ def _generate_response(prompt: str) -> str:
         )
 
         response = client.chat.completions.create(
-            model=model_name, messages=[{"role": "user", "content": prompt}]
+            model=model_name, messages=[{"role": "user", "content": prompt}], **kwargs
         )
         if response:
             if isinstance(response, ChatCompletion):
@@ -579,9 +579,12 @@ def _subject_comparison_key(subject: str) -> str:
     return re.sub(r"[\W_]+", "", str(subject or "").casefold())
 
 
+_STOP_WORDS = {"the", "a", "an", "of", "to", "in", "for", "with", "on", "at", "by", "from", "up", "about", "into", "over", "after", "is", "are", "how", "what", "why", "top", "best", "part", "and", "or", "my", "your", "this", "that"}
+
 def _subject_token_set(subject: str) -> set[str]:
     """Return words used for the dependency-free near-duplicate guard."""
-    return set(re.findall(r"\w+", str(subject or "").casefold(), flags=re.UNICODE))
+    tokens = set(re.findall(r"\w+", str(subject or "").casefold(), flags=re.UNICODE))
+    return tokens - _STOP_WORDS
 
 
 def _lexical_subject_similarity(first: str, second: str) -> float:
@@ -883,7 +886,7 @@ def generate_next_video_subject(
             # even when the configured provider uses deterministic sampling.
             randomization_hint=secrets.token_hex(8),
         )
-        response = _generate_response(prompt)
+        response = _generate_response(prompt, temperature=0.9, presence_penalty=0.5, frequency_penalty=0.5)
         if isinstance(response, str) and response.startswith("Error: "):
             last_error = response
         else:
