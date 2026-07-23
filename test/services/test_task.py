@@ -27,6 +27,30 @@ class TestTaskService(unittest.TestCase):
     def tearDown(self):
         pass
 
+    def test_collect_subject_history_includes_runtime_task_params(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(tm.utils, "task_dir", return_value=temp_dir),
+                patch.object(
+                    tm.sm.state,
+                    "get_all_tasks",
+                    return_value=(
+                        [
+                            {
+                                "task_id": "task-queued",
+                                "state": tm.const.TASK_STATE_PROCESSING,
+                                "params": {"video_subject": "Queued coffee idea"},
+                            }
+                        ],
+                        1,
+                    ),
+                ),
+            ):
+                recent_subjects, all_subjects = tm.collect_subject_history()
+
+        self.assertEqual(recent_subjects, [])
+        self.assertEqual(all_subjects, ["Queued coffee idea"])
+
     def test_generate_script_forwards_advanced_prompt_options(self):
         """
         任务生成入口和 WebUI/API 共用 VideoParams。这里验证自动生成文案时，

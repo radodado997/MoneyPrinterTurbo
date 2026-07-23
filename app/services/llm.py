@@ -575,6 +575,20 @@ def _subject_comparison_key(subject: str) -> str:
     return re.sub(r"[\W_]+", "", str(subject or "").casefold())
 
 
+def _add_unique_subject_for_comparison(
+    subjects: list[str], seen_keys: set[str], subject: str | None
+) -> bool:
+    """Append a subject once, using the same key as duplicate validation."""
+    normalized_subject = str(subject or "").strip()
+    subject_key = _subject_comparison_key(normalized_subject)
+    if not normalized_subject or not subject_key or subject_key in seen_keys:
+        return False
+
+    subjects.append(normalized_subject)
+    seen_keys.add(subject_key)
+    return True
+
+
 def build_next_video_subject_prompt(
     video_subject: str = "",
     recent_subjects: list[str] | None = None,
@@ -653,9 +667,10 @@ Suggest the subject of the next video in an ongoing series.
 ## Rules
 1. Return exactly one concise video subject, and nothing else.
 2. {selection_rule}
-3. Do not repeat or closely copy any subject in the exclusion list.
-4. Do not add a title prefix, numbering, quotation marks, markdown, or an explanation.
-5. {language_rule}
+3. Never return an exact, case-insensitive, or punctuation-insensitive duplicate of any subject in the exclusion list. If your first idea appears there, choose a different subject before answering.
+4. Do not closely copy, paraphrase, or make a minor variation of any subject in the exclusion list.
+5. Do not add a title prefix, numbering, quotation marks, markdown, or an explanation.
+6. {language_rule}
 {randomization_context}
 
 ## Current Video Subject
@@ -729,17 +744,45 @@ def generate_next_video_subject(
     """
     normalized_excluded_subjects = []
     excluded_keys = set()
-    for candidate in excluded_subjects or []:
-        candidate = str(candidate or "").strip()
-        key = _subject_comparison_key(candidate)
-        if candidate and key and key not in excluded_keys:
-            normalized_excluded_subjects.append(candidate)
-            excluded_keys.add(key)
 
-    current_key = _subject_comparison_key(video_subject)
-    if current_key and current_key not in excluded_keys:
-        normalized_excluded_subjects.append((video_subject or "").strip())
-        excluded_keys.add(current_key)
+    # The subject currently visible to the user and the recent category context
+    # are also already-used subjects. Keep them at the front of the prompt-sized
+    # exclusion list so they do not get trimmed when the full task history is
+    # larger than MAX_ROLL_EXCLUDED_SUBJECTS.
+    _add_unique_subject_for_comparison(
+        normalized_excluded_subjects, excluded_keys, video_subject
+    )
+    for candidate in recent_subjects or []:
+        _add_unique_subject_for_comparison(
+            normalized_excluded_subjects, excluded_keys, candidate
+        )
+    for candidate in excluded_subjects or []:
+        _add_unique_subject_for_comparison(
+            normalized_excluded_subjects, excluded_keys, candidate
+        )
+
+    def promote_excluded_subject_for_prompt(subject: str):
+        """Make a rejected duplicate visible in the next retry prompt.
+
+        Validation checks the complete exclusion set, while the prompt includes a
+        bounded subset. If a duplicate was outside that bounded prompt, retries
+        with the same prompt can repeat the same failure. Promoting the rejected
+        subject keeps the next prompt focused on the exact duplicate the model
+        just tried to use.
+        """
+        promoted_subject = str(subject or "").strip()
+        promoted_key = _subject_comparison_key(promoted_subject)
+        if not promoted_subject or not promoted_key:
+            return
+
+        for index, existing_subject in enumerate(normalized_excluded_subjects):
+            if _subject_comparison_key(existing_subject) == promoted_key:
+                normalized_excluded_subjects.pop(index)
+                break
+        else:
+            excluded_keys.add(promoted_key)
+
+        normalized_excluded_subjects.insert(0, promoted_subject)
 
     last_error = "Error: unable to generate the next video subject"
     for attempt in range(_max_retries):
@@ -764,6 +807,7 @@ def generate_next_video_subject(
                 return subject
             if subject:
                 last_error = "Error: the LLM repeated an already generated subject"
+                promote_excluded_subject_for_prompt(subject)
                 logger.warning(
                     "next video subject repeated an existing topic; requesting a different one"
                 )

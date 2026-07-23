@@ -51,6 +51,23 @@ class TestMemoryState(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(state.get_task("task-1")["videos"], ["first.mp4"])
 
+    def test_memory_updates_preserve_existing_metadata(self):
+        state = MemoryState()
+        state.update_task(
+            "task-1",
+            state=const.TASK_STATE_PROCESSING,
+            progress=5,
+            params={"video_subject": "Coffee"},
+            video_subject="Coffee",
+        )
+        state.update_task("task-1", state=const.TASK_STATE_PROCESSING, progress=25)
+
+        task = state.get_task("task-1")
+
+        self.assertEqual(task["params"], {"video_subject": "Coffee"})
+        self.assertEqual(task["video_subject"], "Coffee")
+        self.assertEqual(task["progress"], 25)
+
     def test_concurrent_memory_updates_are_preserved(self):
         state = MemoryState()
         thread_count = 5

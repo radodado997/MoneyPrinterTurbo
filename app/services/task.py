@@ -472,6 +472,20 @@ def is_background_task_running(task_id: str | None = None) -> bool:
         return task_id in _BACKGROUND_TASKS
 
 
+def _params_state_payload(params: VideoParams | dict | None) -> dict:
+    """Return a JSON-safe params payload for runtime task history."""
+    if params is None:
+        return {}
+    if isinstance(params, dict):
+        return dict(params)
+    if hasattr(params, "model_dump"):
+        try:
+            return params.model_dump(mode="json")
+        except TypeError:
+            return params.model_dump()
+    return {}
+
+
 def start_background_task(task_id, params: VideoParams, stop_at: str = "video"):
     with _BACKGROUND_TASKS_LOCK:
         if task_id in _BACKGROUND_TASKS:
@@ -491,7 +505,17 @@ def start_background_task(task_id, params: VideoParams, stop_at: str = "video"):
 
 def start(task_id, params: VideoParams, stop_at: str = "video"):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+    params_payload = _params_state_payload(params)
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=5,
+        video_subject=(
+            getattr(params, "video_subject", "")
+            or params_payload.get("video_subject", "")
+        ),
+        params=params_payload,
+    )
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
