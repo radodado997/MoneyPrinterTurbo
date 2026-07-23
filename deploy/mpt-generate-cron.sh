@@ -18,7 +18,7 @@ payload=$(cat <<JSON
 {
   "video_subject": "",
   "roll_next_subject": true,
-  "based_on_recent": true,
+  "based_on_recent": false,
   "video_language": "${VIDEO_LANGUAGE}"
 }
 JSON
