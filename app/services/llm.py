@@ -550,7 +550,7 @@ def generate_script(
 
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt=prompt)
+            response = _generate_response(prompt=prompt,temperature=0.9, presence_penalty=0.5, frequency_penalty=0.5)
             if response:
                 final_script = format_response(response)
             else:
@@ -1018,7 +1018,7 @@ Please note that you must use English for generating video search terms; Chinese
     response = ""
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt)
+            response = _generate_response(prompt=prompt, temperature=0.9, presence_penalty=0.5, frequency_penalty=0.5)
             if response.startswith("Error: "):
                 # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
                 # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
