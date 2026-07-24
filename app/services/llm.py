@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 import secrets
 from time import perf_counter
@@ -23,7 +24,7 @@ MAX_ROLL_CONTEXT_SUBJECTS = 20
 MAX_ROLL_EXCLUDED_SUBJECTS = 200
 MAX_ROLL_SEMANTIC_SUBJECTS = 200
 DEFAULT_ROLL_SEMANTIC_SIMILARITY_THRESHOLD = 0.90
-DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_ROLL_LEXICAL_SIMILARITY_THRESHOLD = 0.60
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -33,6 +34,131 @@ _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
     re.IGNORECASE,
 )
+
+_ROLL_CATEGORIES = [
+    "science & nature",
+    "personal finance",
+    "health & wellness",
+    "technology",
+    "travel & adventure",
+    "cooking & food",
+    "history & culture",
+    "business & entrepreneurship",
+    "psychology & self-improvement",
+    "arts & creativity",
+    "sports & fitness",
+    "environment & sustainability",
+    "parenting & relationships",
+    "DIY & home",
+    "philosophy & ethics",
+]
+_ROLL_FORMATS = [
+    "how-to guide",
+    "surprising fact",
+    "myth debunked",
+    "step-by-step tutorial",
+    "beginner's introduction",
+    "expert deep-dive",
+    "case study",
+    "comparison",
+    "question that makes you think",
+    "motivational angle",
+]
+_COLD_START_SEED_SUBJECTS = [
+    "The science of habit formation",
+    "How compound interest changes your life",
+    "10 cooking techniques every beginner needs",
+    "The history of the internet in 60 seconds",
+    "Why sleep is your superpower",
+    "Understanding solar energy for beginners",
+    "The psychology of procrastination",
+    "How to start investing with $100",
+    "Unusual travel destinations worth visiting",
+    "The surprising benefits of cold showers",
+]
+
+
+def _ollama_extra_body(seed: int | None = None) -> dict:
+    """Return Ollama-specific sampling parameters."""
+    try:
+        temperature = float(config.app.get("ollama_roll_temperature", 0.9))
+    except (TypeError, ValueError):
+        temperature = 0.9
+    try:
+        top_p = float(config.app.get("ollama_roll_top_p", 0.95))
+    except (TypeError, ValueError):
+        top_p = 0.95
+    try:
+        repeat_penalty = float(config.app.get("ollama_repeat_penalty", 1.1))
+    except (TypeError, ValueError):
+        repeat_penalty = 1.1
+    return {
+        "options": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": seed if seed is not None else random.randint(0, 2**31 - 1),
+            "repeat_penalty": repeat_penalty,
+        }
+    }
+
+
+def _build_roll_randomization_hint(based_on_recent: bool) -> str:
+    """Build a semantically meaningful diversity hint."""
+    nonce = secrets.token_hex(4)
+    if based_on_recent:
+        fmt = random.choice(_ROLL_FORMATS)
+        return f"Format angle to try: {fmt} (nonce:{nonce})"
+
+    cat = random.choice(_ROLL_CATEGORIES)
+    fmt = random.choice(_ROLL_FORMATS)
+    return f"Category: {cat} | Format: {fmt} (nonce:{nonce})"
+
+
+def _format_exclusion_list(subjects: list[str], max_items: int = 50) -> str:
+    """Format the exclusion list as compact numbered entries."""
+    if not subjects:
+        return "(none)"
+    display_items = subjects[:max_items]
+    lines = [f"{i + 1}. {s}" for i, s in enumerate(display_items)]
+    if len(subjects) > max_items:
+        lines.append(f"... and {len(subjects) - max_items} more (all must be avoided)")
+    return "\n".join(lines)
+
+
+def _generate_roll_response(prompt: str) -> str:
+    """Generate a Roll subject with creativity-oriented sampling."""
+    llm_provider = str(
+        config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
+    ).lower()
+
+    if llm_provider == "ollama":
+        temperature = float(config.app.get("ollama_roll_temperature", 0.9))
+        seed = random.randint(0, 2**31 - 1)
+        extra_body = {
+            "options": {
+                "temperature": temperature,
+                "top_p": float(config.app.get("ollama_roll_top_p", 0.95)),
+                "seed": seed,
+                "repeat_penalty": float(config.app.get("ollama_repeat_penalty", 1.1)),
+            }
+        }
+        try:
+            provider = get_llm_provider(llm_provider)
+            base_url = config.get_default_ollama_base_url()
+            model_name = config.app.get(provider.config_key("model_name"), "")
+            client = OpenAI(api_key="ollama", base_url=base_url)
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                extra_body=extra_body,
+            )
+            return _extract_chat_completion_text(response, llm_provider)
+        except Exception as exc:
+            logger.warning(f"ollama roll request failed, falling back: {exc}")
+
+    return _generate_response(prompt)
+
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
 # Role: Video Script Generator
@@ -145,7 +271,7 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
+def _generate_response(prompt: str, **kwargs) -> str:
     try:
         llm_provider = str(
             config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
@@ -181,6 +307,19 @@ def _generate_response(prompt: str) -> str:
             api_key = "ollama"
             if not base_url:
                 base_url = config.get_default_ollama_base_url()
+
+        request_kwargs = dict(kwargs)
+        if llm_provider == "ollama":
+            request_kwargs.pop("presence_penalty", None)
+            request_kwargs.pop("frequency_penalty", None)
+            request_kwargs.pop("stop", None)
+            request_kwargs.setdefault(
+                "temperature",
+                float(config.app.get("ollama_roll_temperature", 0.9)),
+            )
+            request_kwargs["extra_body"] = _ollama_extra_body(
+                request_kwargs.get("seed")
+            )
 
         if adapter == "azure":
             api_version = config.app.get(
@@ -388,7 +527,9 @@ def _generate_response(prompt: str) -> str:
         )
 
         response = client.chat.completions.create(
-            model=model_name, messages=[{"role": "user", "content": prompt}]
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            **request_kwargs,
         )
         if response:
             if isinstance(response, ChatCompletion):
@@ -550,7 +691,7 @@ def generate_script(
 
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt=prompt)
+            response = _generate_response(prompt=prompt,temperature=0.9, presence_penalty=0.5, frequency_penalty=0.5)
             if response:
                 final_script = format_response(response)
             else:
@@ -579,9 +720,12 @@ def _subject_comparison_key(subject: str) -> str:
     return re.sub(r"[\W_]+", "", str(subject or "").casefold())
 
 
+_STOP_WORDS = {"the", "a", "an", "of", "to", "in", "for", "with", "on", "at", "by", "from", "up", "about", "into", "over", "after", "is", "are", "how", "what", "why", "top", "best", "part", "and", "or", "my", "your", "this", "that"}
+
 def _subject_token_set(subject: str) -> set[str]:
     """Return words used for the dependency-free near-duplicate guard."""
-    return set(re.findall(r"\w+", str(subject or "").casefold(), flags=re.UNICODE))
+    tokens = set(re.findall(r"\w+", str(subject or "").casefold(), flags=re.UNICODE))
+    return tokens - _STOP_WORDS
 
 
 def _lexical_subject_similarity(first: str, second: str) -> float:
@@ -717,9 +861,7 @@ def build_next_video_subject_prompt(
     history_context = "\n".join(
         f"- {subject}" for subject in normalized_recent_subjects
     ) or "- (none)"
-    excluded_context = "\n".join(
-        f"- {subject}" for subject in normalized_excluded_subjects
-    ) or "- (none)"
+    excluded_block = _format_exclusion_list(normalized_excluded_subjects)
     language_rule = (
         f"Write the suggestion in {language}."
         if language
@@ -729,18 +871,25 @@ def build_next_video_subject_prompt(
     if based_on_recent:
         selection_rule = (
             "Infer the shared category or content niche from the latest video "
-            "subjects, then suggest a fresh subject in that same category."
+            "subjects, then suggest a fresh subject in that same category. "
+            "Vary the format and angle: sometimes ask a question, sometimes "
+            "give a how-to, sometimes focus on a surprising fact, sometimes "
+            "target beginners, sometimes experts. Do not always use the same "
+            "title structure."
         )
         history_title = "Latest Video Subjects (use these to infer the category)"
     else:
         selection_rule = (
-            "Choose a completely random subject from any category. Do not use the "
-            "latest subjects as a category constraint."
+            "Choose a completely random subject from any category — science, "
+            "history, cooking, finance, travel, psychology, fitness, technology, "
+            "arts, or any other niche. Do not use the latest subjects as a "
+            "category constraint. Pick an unexpected angle or format: question, "
+            "how-to, fact, story, comparison, or list. Be creative."
         )
         history_title = "Latest Video Subjects (do not use these as a category constraint)"
 
     randomization_context = (
-        f"\nRandomization token (do not mention it): {randomization_hint}"
+        f"\nRandomization hint (do not mention it): {randomization_hint}"
         if randomization_hint
         else ""
     )
@@ -766,7 +915,11 @@ Suggest the subject of the next video in an ongoing series.
 {history_context}
 
 ## Previously Generated Subjects — NEVER REPEAT
-{excluded_context}
+{excluded_block}
+
+Important: Do not use any subject from the list above, even if you rephrase it,
+translate it, or change only a few words. The subject must be on a clearly
+different specific topic, not a paraphrase of an existing one.
 
 Return only the new subject.
 """.strip()
@@ -871,6 +1024,17 @@ def generate_next_video_subject(
 
         normalized_excluded_subjects.insert(0, promoted_subject)
 
+    if not normalized_excluded_subjects:
+        logger.debug("no excluded subjects — seeding with cold-start pool")
+        seed_sample = random.sample(
+            _COLD_START_SEED_SUBJECTS,
+            min(5, len(_COLD_START_SEED_SUBJECTS)),
+        )
+        for seed_subject in seed_sample:
+            _add_unique_subject_for_comparison(
+                normalized_excluded_subjects, excluded_keys, seed_subject
+            )
+
     last_error = "Error: unable to generate the next video subject"
     for attempt in range(_max_retries):
         prompt = build_next_video_subject_prompt(
@@ -881,9 +1045,9 @@ def generate_next_video_subject(
             excluded_subjects=normalized_excluded_subjects,
             # A fresh hint makes unticked random mode meaningfully different
             # even when the configured provider uses deterministic sampling.
-            randomization_hint=secrets.token_hex(8),
+            randomization_hint=_build_roll_randomization_hint(based_on_recent),
         )
-        response = _generate_response(prompt)
+        response = _generate_roll_response(prompt)
         if isinstance(response, str) and response.startswith("Error: "):
             last_error = response
         else:
@@ -907,12 +1071,18 @@ def generate_next_video_subject(
                 if similar_subject is not None:
                     matching_subject, score, method = similar_subject
                     promote_excluded_subject_for_prompt(matching_subject)
+                    from app.services import task as _task_module
+
+                    _task_module.persist_rejected_subject(subject)
                     last_error = "Error: the LLM generated a subject too similar to an existing subject"
                     logger.warning(
                         f"next video subject was rejected as a {method} match "
                         f"({score:.3f}) to '{matching_subject}'; requesting a different one"
                     )
                 else:
+                    from app.services import task as _task_module
+
+                    _task_module.persist_rejected_subject(subject)
                     last_error = "Error: the LLM repeated an already generated subject"
                     logger.warning(
                         "next video subject repeated an existing topic; requesting a different one"
@@ -1015,7 +1185,7 @@ Please note that you must use English for generating video search terms; Chinese
     response = ""
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt)
+            response = _generate_response(prompt=prompt, temperature=0.9, presence_penalty=0.5, frequency_penalty=0.5)
             if response.startswith("Error: "):
                 # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
                 # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，

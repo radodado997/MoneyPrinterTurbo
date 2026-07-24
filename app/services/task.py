@@ -93,6 +93,32 @@ def reserve_generated_subject(subject: str) -> bool:
     return True
 
 
+def persist_rejected_subject(subject: str) -> None:
+    """Persist a rejected Roll subject so it stays excluded across restarts."""
+    subject = str(subject or "").strip()
+    if not subject:
+        return
+
+    with _GENERATED_SUBJECTS_LOCK:
+        subjects = _read_generated_subjects()
+        key = _subject_key(subject)
+        if key in {_subject_key(existing) for existing in subjects}:
+            return
+
+        subjects.append(subject)
+        ledger_path = _generated_subjects_path()
+        temp_path = f"{ledger_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as file:
+                json.dump(subjects, file, ensure_ascii=False)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, ledger_path)
+            logger.debug(f"persisted rejected subject to ledger: {subject}")
+        except OSError:
+            logger.warning("failed to persist rejected subject to ledger")
+
+
 def collect_subject_history(limit: int = 1000) -> tuple[list[str], list[str]]:
     """Return recent completed subjects and all persisted/active subjects.
 
